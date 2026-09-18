@@ -1829,7 +1829,7 @@ def incremental_parent(repository,m,explicit=None,full=False,native_only=False,r
     if full:
         return None
     candidates=[(p,old) for p,old in catalog(repository)
-                if chain_identity(old)==chain_identity(m)
+                if not old.get('ephemeral',False) and chain_identity(old)==chain_identity(m)
                 and snapshot_stamp(old['snapshot'])<=snapshot_stamp(m['snapshot'])
                 and (not native_only or old.get('storage')=='native')]
     if explicit:
@@ -2591,10 +2591,10 @@ def backup_destination_locked(destination,source,needed,unattended=False,require
         raise Error('Backup destination must be a whole disk device; directory inputs are not supported')
 
 
-def snapshot_source_pools(pools,snapshot):
+def snapshot_source_pools(pools,snapshot,completed=None):
     # Snapshot transactions cannot span pools. Finish each recursive snapshot
     # before any replication starts; the pools have slightly different times.
-    completed=[]
+    completed=[] if completed is None else completed
     try:
         for pool in pools:
             name=pool['name']+'@'+snapshot
@@ -2604,6 +2604,24 @@ def snapshot_source_pools(pools,snapshot):
         if completed:
             print('Source snapshots already created and retained: '+', '.join(completed),file=sys.stderr)
         raise
+
+
+def remove_ephemeral_snapshots(completed):
+    # Remove only this operation's named snapshots, never newer snapshots.
+    errors=[]
+    for name in list(completed):
+        try:
+            run('zfs','destroy','-r',name)
+            completed.remove(name)
+        except Exception as exc:
+            errors.append(f'{name}: {exc}')
+    require(not errors,'Temporary source snapshot cleanup failed: '+'; '.join(errors))
+
+
+def validate_ephemeral_backup(args):
+    if getattr(args,'ephemeral',False):
+        for option in ('incremental','stack','snapshot_name','snapshot_index'):
+            require(not getattr(args,option,None),'--ephemeral cannot be combined with --'+option)
 
 
 def source_snapshot_choices(pools):
@@ -2651,6 +2669,8 @@ def backup_storage(args,manifest,needed):
 
 def backup(args):
     global LOG
+    validate_ephemeral_backup(args)
+    ephemeral=bool(getattr(args,'ephemeral',False))
     forced_incremental=bool(getattr(args,'incremental',False))
     require(not (forced_incremental and getattr(args,'full',False)),'--full and --incremental cannot be combined')
     commands('lsblk blkid findmnt sgdisk zpool zfs zdb zstream wipefs mount umount tar zstd partprobe udevadm')
@@ -2700,10 +2720,11 @@ def backup(args):
             if compression:
                 check_compression_pool(compression,storage_dataset.split('/')[0],storage_run)
                 print(f'{diag_stamp()} Backup target dataset compression: '+compression)
-            previous=incremental_parent(parent,m,None,args.full,native_only=True,
+            previous=incremental_parent(parent,m,None,args.full or ephemeral,native_only=True,
                                         **({'required':True} if forced_incremental else {}),**remote_kw)
             require(not forced_incremental or (previous and all(p.get('replication_type')!='full' for p in m['pools'])),
                     '--incremental requires a usable matching base for every source pool; full backup fallback is disabled')
+            if ephemeral:m['ephemeral']=True
             m['version']=5; m['storage']='native'; m['storage_pool_guid']=storage_guid
             if previous:
                 previous_path,previous_manifest=previous
@@ -2737,11 +2758,13 @@ def backup(args):
             for directory in ('disk','efi','zfs'):
                 (out/directory).mkdir()
             LOG=open(out/'backup.log','w')
+            temporary_snapshots=[]
             try:
                 print(f'{diag_stamp()} Backing up {m["disk"]["device"]} to {out}')
                 # All pool snapshots are established before the first stream starts.
                 if not existing_source_snapshot:
-                    snapshot_source_pools(m['pools'],m['snapshot'])
+                    snapshot_source_pools(m['pools'],m['snapshot'],
+                                          **({'completed':temporary_snapshots} if ephemeral else {}))
                 streams={}
                 for pool in m['pools']:
                     name=pool['name']; pool['datasets']=props('zfs',name,True)
@@ -2834,11 +2857,19 @@ def backup(args):
                 os.sync()
                 report_destination_compression('Backup',[(p['name'],p['native_dataset']) for p in m['pools']],
                                                storage_run,compression=totals.compression)
-                print(f'{diag_stamp()} Backup complete: {out.name}. Source snapshot retained: {m["snapshot"]}')
-                return totals
             finally:
                 if LOG:
                     LOG.close(); LOG=None
+                if temporary_snapshots:
+                    failed=sys.exc_info()[0] is not None
+                    try:remove_ephemeral_snapshots(temporary_snapshots)
+                    except Exception as exc:
+                        if not failed:raise
+                        print(str(exc),file=sys.stderr)
+            status=('Temporary source snapshots removed; full restore only.' if ephemeral else
+                    f'Source snapshot retained: {m["snapshot"]}')
+            print(f'{diag_stamp()} Backup complete: {out.name}. {status}')
+            return totals
 
 
 def beneath(root,relative):
@@ -3905,6 +3936,8 @@ def restore_from_storage(args,base,remote=None):
     base=selected
     chain=verify_chain(base,read_native=False,**remote_kw)
     m=copy.deepcopy(chain[-1][1])
+    require(not (m.get('ephemeral',False) and getattr(args,'incremental',False)),
+            'Ephemeral backups support full restore only; omit --incremental')
     restore_compression(m,getattr(args,'compression',None))
     if getattr(args,'stack',False):m['_restore_stack']=True
     if getattr(args,'unattended',False):
@@ -4616,6 +4649,11 @@ BACKUP
   --diagnostic
       Log transfer stages, process IDs/wait states, pool I/O, and cleanup to
       the terminal and a diagnostic file in the current directory.
+  --ephemeral
+      Create a full backup, then remove only its temporary source snapshots.
+      Full restore only; incompatible with --incremental, --stack and snapshot selection.
+      Cleanup failures are reported and may leave temporary snapshots behind.
+
   --full
       Start a new full generation, leaving previous generations intact.
   --incremental
@@ -4923,6 +4961,7 @@ def main(argv=None,*,restore_isolated=False):
     source_snapshot.add_argument('--snapshot_index',dest='snapshot_index',type=int,help='Existing source snapshot number, 1 being the most recent')
     bp.add_argument('--host',help='Hostname under which to store the backup')
     bp.add_argument('--unattended',action='store_true',help='Never prompt or erase disks; require an unambiguous existing backup destination')
+    bp.add_argument('--ephemeral',action='store_true',help='Full backup using temporary source snapshots removed afterward; full restore only')
     bp.add_argument('--stack',action='store_true',help='Include source snapshot history: all history for full backups, intermediate snapshots for incrementals; default sends only the selected snapshot')
     bp.add_argument('--compression',type=compression_method,metavar='METHOD',help='Override compression on all backup target datasets (e.g. lz4, zstd-3, gzip-6, off)')
     rp=sub.add_parser('restore',help='Restore a selected recovery point to a disk')

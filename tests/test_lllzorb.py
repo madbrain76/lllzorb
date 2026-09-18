@@ -3074,6 +3074,51 @@ class UbuntuRestoreTests(unittest.TestCase):
         self.assertEqual(journals,[])
 
 
+class EphemeralBackupTests(unittest.TestCase):
+    def test_conflicting_flags_fail_before_discovery(self):
+        from types import SimpleNamespace
+        for option in ('incremental','stack','snapshot_name','snapshot_index'):
+            with self.subTest(option=option), patch.object(z,'discover') as discover:
+                with self.assertRaisesRegex(z.Error,'--ephemeral cannot'):
+                    z.backup(SimpleNamespace(ephemeral=True,**{option:True}))
+                discover.assert_not_called()
+
+    def test_partial_creation_cleanup_only_deletes_owned_snapshot(self):
+        completed=[]
+        with patch.object(z,'run',side_effect=['',z.Error('exists')]), patch('sys.stderr',new_callable=io.StringIO):
+            with self.assertRaises(z.Error):
+                z.snapshot_source_pools([{'name':'bpool'},{'name':'rpool'}],'temporary',completed)
+        self.assertEqual(completed,['bpool@temporary'])
+        with patch.object(z,'run') as run:
+            z.remove_ephemeral_snapshots(completed)
+        run.assert_called_once_with('zfs','destroy','-r','bpool@temporary')
+        self.assertEqual(completed,[])
+
+    def test_cleanup_failure_attempts_remaining_pools_and_reports(self):
+        completed=['bpool@temporary','rpool@temporary']
+        with patch.object(z,'run',side_effect=[z.Error('busy'),'']) as run:
+            with self.assertRaisesRegex(z.Error,'bpool@temporary: busy'):
+                z.remove_ephemeral_snapshots(completed)
+        self.assertEqual(run.call_count,2)
+        self.assertEqual(completed,['bpool@temporary'])
+
+    def test_ephemeral_backup_cannot_be_incremental_base(self):
+        m=fixture();old=copy.deepcopy(m);old['ephemeral']=True
+        with patch.object(z,'catalog',return_value=[(Path('/backup'),old)]), patch.object(z,'run') as run:
+            self.assertIsNone(z.incremental_parent('/repo',m))
+        run.assert_not_called()
+
+    def test_incremental_restore_rejected_before_destination_work(self):
+        from types import SimpleNamespace
+        m=fixture();m['ephemeral']=True
+        with patch.object(z,'select_backup',return_value=Path('/backup')), \
+             patch.object(z,'verify_chain',return_value=[(Path('/backup'),m)]), \
+             patch.object(z,'restore_compression') as compression:
+            with self.assertRaisesRegex(z.Error,'full restore only'):
+                z.restore_from_storage(SimpleNamespace(incremental=True),'/repo')
+        compression.assert_not_called()
+
+
 class UbuntuSnapshotTests(unittest.TestCase):
     def test_each_pool_uses_a_separate_recursive_snapshot_command(self):
         with patch.object(z,'run') as run:
@@ -3481,7 +3526,13 @@ class RemoteReplicationTests(unittest.TestCase):
     def test_stacked_backup_compression_applies_to_boot_pool_copy(self):
         self.backup_run(compression='zstd-3',ubuntu=True,policy='history')
 
-    def backup_run(self,fail=False,late=False,policy=None,incremental=False,reseed=False,blocked=None,forced=False,compression=None,ubuntu=False):
+    def test_ephemeral_backup_cleans_source_after_publication(self):
+        self.backup_run(ephemeral=True)
+
+    def test_ephemeral_backup_cleans_source_after_transfer_failure(self):
+        self.backup_run(ephemeral=True,fail=True)
+
+    def backup_run(self,fail=False,late=False,policy=None,incremental=False,reseed=False,blocked=None,forced=False,compression=None,ubuntu=False,ephemeral=False):
         from argparse import Namespace
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);repository=root/'cache';repository.mkdir()
@@ -3504,7 +3555,7 @@ class RemoteReplicationTests(unittest.TestCase):
                 m['pools'][0]['datasets']['tank/new@seed']={'guid':{'value':'123'},'createtxg':{'value':'1'}}
                 if reseed:m['pools'][0]['replication_type']='full'
             remote=z.RemoteRepository('server');remote.dataset='store';remote.guid='999';remote.cache=repository
-            events=[];estimates=[]
+            events=[];estimates=[];local_events=[]
             def remote_run(*args,**kwargs):
                 events.append(args)
                 if args[:2]==('zfs','get') and 'guid' in args:return '123'
@@ -3526,6 +3577,7 @@ class RemoteReplicationTests(unittest.TestCase):
                     return f'{args[-1]}\t{z.GIB}\t0\t{2*z.GIB}\t2.35\n'
                 return ''
             def local_run(*args,**kwargs):
+                local_events.append(args)
                 if args[:3]==('zfs','send','-n'):
                     estimates.append(args[-1]);return 'size\t1000\n'
                 if args[0]=='sgdisk' and args[1].startswith('--backup='):
@@ -3545,6 +3597,7 @@ class RemoteReplicationTests(unittest.TestCase):
                 self.assertTrue((point/'SHA256SUMS').is_file())
                 saved=json.loads((point/'manifest.json').read_text())
                 self.assertEqual(saved['version'],5)
+                self.assertEqual(saved.get('ephemeral',False),ephemeral)
                 if ubuntu:
                     boot=saved['pools'][0]
                     self.assertEqual(boot['properties']['feature@zstd_compress']['value'],'disabled')
@@ -3562,8 +3615,8 @@ class RemoteReplicationTests(unittest.TestCase):
                 self.assertTrue(any(e[:2]==('zfs','hold') for e in events))
                 self.assertFalse(any(e[:2]==('zfs','inherit') for e in events))
                 events.append(('publish',))
-            args=Namespace(destination=None,remote='server',full=not incremental and not forced,
-                           incremental=forced,incremental_from=None,stack=policy=='history',compression=compression)
+            args=Namespace(destination=None,remote='server',full=not incremental and not forced and not ephemeral,
+                           incremental=forced,incremental_from=None,stack=policy=='history',compression=compression,ephemeral=ephemeral)
             transfers=[]
             def transfer_stream(*args,**kwargs):
                 transfers.append(args)
@@ -3596,6 +3649,11 @@ class RemoteReplicationTests(unittest.TestCase):
                     self.assertEqual(transferred.uncompressed,1234*len(transfers))
                     self.assertEqual(transferred.compressed,500*len(m['pools']))
                     self.assertEqual(transferred.compression,compression or 'no override')
+            if ephemeral:
+                self.assertTrue(select_parent.call_args.args[3])
+                self.assertEqual([e for e in local_events if e[:2]==('zfs','destroy')],
+                                 [('zfs','destroy','-r',p['name']+'@'+m['snapshot']) for p in m['pools']])
+                self.assertNotIn('Source snapshot retained:',completion_output.getvalue())
             output=progress_output.getvalue()
             self.assertNotIn('skipped for boot compatibility',completion_output.getvalue())
             ratio_reads=[e[-1] for e in events if e[:2]==('zfs','list') and e[-2].endswith(',compressratio')]

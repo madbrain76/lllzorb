@@ -116,6 +116,14 @@ e. command-line flags
         Logs transfer stages, process IDs and wait states, pool I/O, command timings and cleanup.
         Writes to the terminal and lllzorb-diagnostic-<timestamp>-<pid>.log in the current directory.
 
+--ephemeral
+        Creates a full backup and removes its temporary source snapshots after completion, including normal failure or cancellation.
+        Existing snapshots and snapshots created by other operations are preserved. No clone is created.
+        These backups can ONLY be restored with a full restore, NOT an incremental restore, and are not used as incremental backup bases.
+        Cannot be combined with --incremental, --stack, --snapshot_name, or --snapshot_index. --full is optional.
+        If transfer processes cannot stop or cleanup fails, temporary snapshots may remain; the program reports this.
+        A crash or forced termination can also leave temporary snapshots behind.
+
 --full
         forces a full backup
 
