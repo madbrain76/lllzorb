@@ -74,6 +74,21 @@ Tested backup targets
 SATA SSD attached to StarTech USB 3.0 to SATA bridge
 Samsung T9 USB SSD
 
+Installation
+------------
+From the project directory, run:
+
+    sudo sh ./install.sh
+
+This installs lllzorb in /usr/local/bin and README.txt and LICENSE in /usr/local/share/doc/lllzorb.
+Run the same command to update it. An optional absolute installation prefix can be supplied:
+
+    sh ./install.sh "$HOME/.local"
+
+The installer copies files only; it does not install dependencies or change ZFS configuration.
+Python 3 and the system utilities required by each command must already be installed.
+Run lllzorb with sudo for backup and restore operations.
+
 Usage
 -----
 
