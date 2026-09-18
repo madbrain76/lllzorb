@@ -2474,7 +2474,36 @@ class SameHostBootTests(unittest.TestCase):
         self.assertEqual([c.args[2] for c in run.call_args_list if c.args[:2]==('mount','--bind')],
                          ['/dev/null','/dev/zero','/dev/random','/dev/urandom'])
 
-    def test_bios_image_targets_selected_disk_only_and_cleans_up_on_failure(self):
+    def test_proxmox_bios_preserves_esp_boot_files(self):
+        self.file('/boot/grub/grub.cfg',b'zfs config')
+        self.file('/esp/grub/grub.cfg',b'fat config')
+        (self.root/'esp/grub/i386-pc').mkdir()
+        with patch.object(z,'run',return_value='ABCD-1234\n') as run:
+            self.assertEqual(z.restored_bios_location(self.root,self.root/'esp','/dev/target-part2',
+                             dict(guid=self.new,prefix='/ROOT/os@/boot/grub')),
+                             ('/grub','ABCD-1234','fat'))
+        run.assert_called_once_with('blkid','-p','-s','UUID','-o','value','/dev/target-part2')
+
+    def test_proxmox_bios_rejects_missing_esp_identity(self):
+        self.file('/esp/grub/grub.cfg',b'config')
+        (self.root/'esp/grub/i386-pc').mkdir()
+        with patch.object(z,'run',return_value=''):
+            with self.assertRaisesRegex(z.Error,'ESP UUID'):
+                z.restored_bios_location(self.root,self.root/'esp','/dev/target-part2',{})
+
+    def test_bios_without_fat_modules_retains_zfs_boot_path(self):
+        self.file('/boot/grub/grub.cfg',b'config')
+        self.file('/esp/grub/grub.cfg',b'efi-only config')
+        with patch.object(z,'run') as run:
+            self.assertEqual(z.restored_bios_location(self.root,self.root/'esp','/dev/target-part2',
+                             dict(guid=self.new,prefix='/ROOT/os@/boot/grub')),
+                             ('/ROOT/os@/boot/grub',f'{int(self.new):016x}','zfs'))
+        run.assert_not_called()
+
+    def test_fat_bios_image_targets_selected_disk_only(self):
+        self.test_bios_image_targets_selected_disk_only_and_cleans_up_on_failure(esp_boot=True)
+
+    def test_bios_image_targets_selected_disk_only_and_cleans_up_on_failure(self,esp_boot=False):
         self.file('/usr/bin/grub-mkimage',executable=True)
         self.file('/usr/lib/grub/i386-pc/grub-bios-setup',executable=True)
         self.file('/usr/lib/grub/i386-pc/boot.img',b'boot')
@@ -2490,11 +2519,18 @@ class SameHostBootTests(unittest.TestCase):
             return real_stat(path,*args,**kwargs)
         with tempfile.TemporaryDirectory() as tmp:
             esp=Path(tmp)
+            if esp_boot:
+                (esp/'grub/i386-pc').mkdir(parents=True)
+                (esp/'grub/grub.cfg').write_text('config')
             def execute(*args):
+                if args[0]=='blkid':return 'ABCD-1234'
                 if args[0]!='chroot':return ''
                 stage=next(esp.glob('.restore-bios-*'))
                 if args[2].endswith('grub-mkimage'):
-                    self.assertIn(f'{int(self.new):016x}',(stage/'load.cfg').read_text())
+                    self.assertIn('ABCD-1234' if esp_boot else f'{int(self.new):016x}',
+                                  (stage/'load.cfg').read_text())
+                    self.assertIn('fat' if esp_boot else 'zfs',args)
+                    self.assertEqual(args[args.index('-p')+1],'/grub' if esp_boot else '/ROOT/os@/boot/grub')
                     (stage/'core.img').write_bytes(b'x'*1024)
                 else:
                     self.assertEqual((stage/'device.map').read_text(),'(hd0) '+device+'\n')
@@ -2511,7 +2547,7 @@ class SameHostBootTests(unittest.TestCase):
             binds=[c for c in calls if c[:2]==('mount','--bind')]
             self.assertEqual([c[2] for c in binds[1:]],[device,part])
             self.assertEqual([c[-1] for c in calls if c[0]=='umount'],[c[-1] for c in reversed(binds)])
-            self.assertEqual(list(esp.iterdir()),[])
+            self.assertEqual(list(esp.iterdir()),[esp/'grub'] if esp_boot else [])
 
     def test_efi_only_installation_does_not_require_zfs_grub_configuration(self):
         self.installation(dracut=False)

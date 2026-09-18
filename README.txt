@@ -217,6 +217,7 @@ g. command-line flags
 
 --discard <on|off>
         Defaults to off. With on, discard the confirmed target before full restore. Any discard failure aborts restore.
+        Discard often does not work through USB bridges or on HDDs, which is why it is off by default.
         --discard on is not allowed with --incremental.
 
 --allow-small-target

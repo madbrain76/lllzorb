@@ -3071,6 +3071,17 @@ def rebuild_restored_initramfs_tools(root):
     return kernels
 
 
+def restored_bios_location(root,esp,esp_device,boot):
+    # Preserve Proxmox's FAT boot files instead of redirecting GRUB to ZFS.
+    if beneath(esp,'/grub/grub.cfg').is_file() and beneath(esp,'/grub/i386-pc').is_dir():
+        identity=run('blkid','-p','-s','UUID','-o','value',esp_device).strip()
+        require(re.fullmatch(r'[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}',identity),
+                'Missing or invalid restored BIOS ESP UUID')
+        return '/grub',identity,'fat'
+    require(beneath(root,'/boot/grub/grub.cfg').is_file(),'Restored GRUB configuration is missing')
+    return boot['prefix'],f'{int(boot["guid"]):016x}','zfs'
+
+
 def rebuild_restored_bios(root,esp,device,esp_device,boot):
     """Embed a fresh core image using only the selected target's device nodes."""
     builder=restored_executable(root,'grub-mkimage')
@@ -3079,14 +3090,13 @@ def rebuild_restored_bios(root,esp,device,esp_device,boot):
         candidate='/usr/lib/grub/i386-pc/grub-bios-setup'
         if os.access(beneath(root,candidate),os.X_OK):setup=candidate
     require(builder and setup,'Changed pool identities require GRUB BIOS image/setup tools')
-    require(beneath(root,'/boot/grub/grub.cfg').is_file(),'Restored GRUB configuration is missing')
-    prefix=boot['prefix']
+    prefix,identity,filesystem=restored_bios_location(root,esp,esp_device,boot)
     require(re.fullmatch(r'/[A-Za-z0-9_./@+-]+',prefix),'Unsupported GRUB dataset path')
     binds=[]
     with tempfile.TemporaryDirectory(prefix='.restore-bios-',dir=esp) as directory:
         stage=Path(directory)
         shutil.copyfile(beneath(root,'/usr/lib/grub/i386-pc/boot.img'),stage/'boot.img')
-        (stage/'load.cfg').write_text(f'search --no-floppy --fs-uuid --set=root {int(boot["guid"]):016x}\n'
+        (stage/'load.cfg').write_text(f'search --no-floppy --fs-uuid --set=root {identity}\n'
                                      f'set prefix=($root){prefix}\n')
         (stage/'device.map').write_text('(hd0) '+device+'\n')
         target=beneath(root,'/run/restore-bios');target.mkdir()
@@ -3102,7 +3112,7 @@ def rebuild_restored_bios(root,esp,device,esp_device,boot):
                     link.symlink_to(os.path.relpath(dest,link.parent))
             run('chroot',root,builder,'-O','i386-pc','-d','/usr/lib/grub/i386-pc',
                 '-p',prefix,'-c','/run/restore-bios/load.cfg','-o','/run/restore-bios/core.img',
-                'biosdisk','part_gpt','zfs','search','search_fs_uuid','normal','configfile')
+                'biosdisk','part_gpt',filesystem,'search','search_fs_uuid','normal','configfile')
             require((stage/'core.img').is_file() and (stage/'core.img').stat().st_size>512,
                     'GRUB produced an invalid BIOS core image')
             run('chroot',root,setup,'--skip-fs-probe','--directory=/run/restore-bios',
@@ -3196,7 +3206,9 @@ def refresh_restored_dracut_worker(payload):
                         if changes:
                             rewrite_boot_pool_guids(esp,changes,esp=True)
                         if (changes and payload.get('bios') and not bios_done
-                                and beneath(root,'/boot/grub/grub.cfg').is_file()):
+                                and (beneath(root,'/boot/grub/grub.cfg').is_file()
+                                     or (beneath(esp,'/grub/grub.cfg').is_file()
+                                         and beneath(esp,'/grub/i386-pc').is_dir()))):
                             rebuild_restored_bios(root,esp,payload['device'],device,payload['bios'])
                             bios_done=True
                         for path in esp.rglob('*'):
@@ -3258,7 +3270,7 @@ def refresh_restored_dracut(m,restored,device,layout):
             require(result.returncode==0,'Could not unlock restored OS dataset: '+encryptionroot)
     # runpy keeps this executable self-contained without adding a public command.
     worker="import json,runpy,sys; runpy.run_path(sys.argv[1])['refresh_restored_dracut_worker'](json.load(sys.stdin))"
-    print(f'{diag_stamp()} Preparing restored Dracut boot images in a private mount namespace…',flush=True)
+    print(f'{diag_stamp()} Preparing restored boot images in a private mount namespace…',flush=True)
     # Inherit output and disable Python buffering so phase starts are visible
     # while work runs, rather than replaying timestamps after the worker exits.
     run('unshare','--mount','--propagation','private',sys.executable,'-u','-c',worker,
