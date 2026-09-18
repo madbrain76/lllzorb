@@ -2,8 +2,6 @@ lllzorb 0.1
 
 Live Local Linux ZFS OS Recovery & Backup
 
-Version 0.1 is displayed on every invocation, including help and usage errors.
-
 WARNING: RISK OF PERMANENT DATA LOSS — USE ENTIRELY AT YOUR OWN RISK
 -----------------------------------------------------------------
 THIS SOFTWARE CAN PERMANENTLY ERASE DISKS, DESTROY BACKUPS, CORRUPT DATA, AND LEAVE SYSTEMS UNBOOTABLE.
@@ -41,9 +39,17 @@ routine backups.
 
 Why local?
 -----------
-In case of disaster, the router will be down, and thus the entire network will be, too.
+In case of disaster, the router will be down, and thus the entire LAN/WLAN will be, too, as well as
+lights and switches.
 Reconstructing the router boot disk is the purpose of the restore, and the restore process
 thus can't depend on a remote server.
+A lengthy restore process is also not ideal, and should only need to be performed in case of
+hardware failure. The most common intended usage case is one where I make live backups of the boot
+disk, and periodically restore them to spare boot disks that are ready to be reinserted into the
+host, should its boot disk fail. The downtime is thus brought down to seconds - removing the
+failed SSD boot disk from the front SATA hotswap bay, and inserting a clone.
+If a clone is unavailable, a lengthier local restore process is possible, but there is currently
+no boot media to do so.
 
 Why Linux?
 -----------
@@ -100,11 +106,11 @@ If there is only a single existing backup disk connected, and no unmounted targe
 e. command-line flags
 
 --compression <method>
-        Set compression on all backup target datasets, including boot-pool copies. Examples: lz4, zstd, zstd-3, gzip-6, off.
+        Set compression on all backup target datasets, including boot pool copies. Examples: lz4, zstd, zstd-3, gzip-6, off.
         Required compression features must already be enabled on the backup storage pool.
         Original source compression settings are retained for restore, including those for Ubuntu bpool.
-        Raw encrypted streams cannot be recompressed. Source datasets are unchanged.
-        Incremental backups apply the method to newly written blocks; existing blocks are not rewritten.
+        Raw encrypted streams cannot be recompressed. Incremental backups apply the method to newly written blocks;
+        existing blocks are not rewritten.
 
 --diagnostic
         Logs transfer stages, process IDs and wait states, pool I/O, command timings and cleanup.
@@ -162,6 +168,11 @@ You will be prompted to confirm the drive to overwrite during restore.
 Ctrl-C requests cancellation and waits for cleanup. Further Ctrl-C signals are ignored during cleanup.
 An interrupted restore can leave the destination incomplete.
 
+All full and incremental restores temporarily use sync=disabled on the destination for performance, whether run on the original
+host or another host. Before successful completion, each dataset's saved sync setting is restored and zpool sync flushes pending
+writes before export. sync=disabled remains in effect afterward only for datasets whose saved setting was disabled.
+These temporary settings apply only to the destination; the running OS pools are unchanged.
+
 g. command-line flags
 
 --stack
@@ -172,13 +183,9 @@ g. command-line flags
         Full selected-only restore of inherited encryption or encrypted clones requires --stack.
 
 --compression <method>
-        Set compression on restored datasets outside a separate boot pool. Examples: lz4, zstd, zstd-3, gzip-6, off.
-        Separate boot pools (such as Ubuntu bpool) use their original source compression, regardless of backup storage compression.
-        Proxmox rpool is eligible. Boot compatibility exemptions show the skipped selection and saved compression settings.
-        Required compression features must already be enabled on the target pool (and saved pool for full restore).
-        Raw encrypted streams cannot be recompressed. Source datasets are unchanged.
-        Incremental restores apply the method to newly written blocks; existing blocks are not rewritten.
-        Backup storage compression overrides are not included in restore streams.
+        By default, the original dataset compression method will be used during restore. This setting allows customizing
+        compression, and applies to all datasets, except a separate boot pool, such as the Ubuntu boot pool.
+        The Proxmox rpool is eligible for any compression setting.
 
 --swap <MB>
         Specify the target swap partition size in MB. Not allowed with --incremental.
@@ -206,7 +213,7 @@ g. command-line flags
 
 --allow-small-target
         Allow full restore despite an estimated capacity shortfall. Out-of-space failure remains possible.
-        Without this flag, unattended restore rejects the shortfall. Not allowed with --incremental.
+        Without this flag, unattended restore rejects the shortfall. In interactive mode, you will be prompted.
 
 --dry-run
         Validate and show the proposed restore without writing the target.
@@ -269,13 +276,12 @@ Lock conflicts return a non-zero exit code. Locks are also retained by transfer 
 
 Same-host restore
 -----------------
-A backup of the running host can be restored onto a separate idle disk. When the original pools are imported, the destination
+Same-host restore means restoring a backup onto a separate idle disk attached to the currently running host.
+It does not restore onto or overwrite the host's currently running boot disk. When the original pools are imported, the destination
 keeps new pool identities and its boot configuration and initramfs images are updated. The running OS pools are never renamed,
 exported or assigned new identities. Existing backups work; no new backup or extra flag is required.
 Incremental restore also supports these targets, provided the partition layout matches and a common snapshot remains.
 Dracut initramfs images are rebuilt and validated during both full and incremental restores.
-Restore uses sync=disabled while writing the destination. Before successful completion, each dataset's saved sync setting is restored
-and zpool sync flushes pending writes before export. The running OS pools are unchanged.
 Restored fstab entries use destination disk paths; UUID and PARTUUID references are updated if the destination identifiers differ.
 An older target sharing an imported pool's identity needs a full restore first, or a recovery environment without that pool imported.
 Use the completed disk in place of the original when booting; partition and filesystem identifiers are still preserved.
@@ -299,5 +305,3 @@ Multiple snapshot branches, from clones, are not supported.
 Backup/restore onto a LAN ZFS target, as opposed to a locally attached drive, has not been tested.
 
 There is no GUI.
-
-There is no boot media for the restore process.
