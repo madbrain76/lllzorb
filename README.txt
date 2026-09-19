@@ -289,6 +289,14 @@ verification and cleanup. The restore timer starts after confirmation; the backu
 Incremental totals exclude retained data; estimates and destination dataset sizes are never used for transfer rates.
 Stream bytes include ZFS stream headers. Destination compression occurs separately, so this is not a physical disk-write rate.
 
+4. clone command
+----------------
+
+This creates a clone of the current boot disk. The only required input is the target disk. You can then shut down
+your host, disconnect the existing boot disk, insert the clone, and boot from it. If you use hot swap, you can just
+keep this cloned disk handy for future disaster recovery, for example if your live boot disk hardware fails, becomes
+corrupt, has unwanted configuration or software regressions, or any other reason you might want to switch disk.
+
 Concurrent operations
 ---------------------
 Local locks coordinate operations without a daemon. Each restore destination is locked from selection through cleanup,
