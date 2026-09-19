@@ -846,22 +846,40 @@ def partition_device(disk, number):
                 time.sleep(0.1)
     else:
         raise last_error
-    # The by-id alias can outpace the kernel rescan: the alias may resolve while
-    # the partition node is not yet visible to lsblk. Wait, bounded, for the node.
+    # The by-id alias can outpace the kernel rescan, and udev can momentarily drop
+    # and recreate that alias while it re-runs on a change event (for example while
+    # the ESP is formatted/mounted or the MBR bytes are rewritten on the same disk).
+    # Resolve the alias, its kernel node, and its parent disk together and retry the
+    # whole lookup within the rescan window, so a transient alias flap cannot abort a
+    # partition this restore just created (the parent lookup used to re-resolve the
+    # alias once, outside the retry, and could then raise "Block device not found"
+    # for a partition that is present). Identity mismatches are not rescan races and
+    # fail immediately.
     deadline=time.monotonic()+PARTITION_RESYNC_TIMEOUT
     while True:
         try:
             node=node_for(partition)
-            break
+            kernel=os.path.realpath(partition)   # /dev/sdXN while the alias resolves
+            parent=disk_for(kernel)              # parent disk via the stable kernel name
         except Error as exc:
             if time.monotonic()>=deadline:
                 raise
             time.sleep(0.05)
-    require(node['type'] == 'part' and
-            os.path.realpath(disk_for(partition)) == os.path.realpath(disk),
-            f'Partition ID does not belong to selected disk: {partition}')
-    kernel_name = Path(os.path.realpath(partition)).name
-    require(int(Path('/sys/class/block', kernel_name, 'partition').read_text()) == number,
+            continue
+        require(node['type'] == 'part' and
+                os.path.realpath(parent) == os.path.realpath(disk),
+                f'Partition ID does not belong to selected disk: {partition}')
+        break
+    # The kernel partition sysfs entry can lag the alias by a moment as well.
+    while True:
+        try:
+            kernel_partition=int(Path('/sys/class/block', Path(kernel).name, 'partition').read_text())
+            break
+        except OSError as exc:
+            if time.monotonic()>=deadline:
+                raise
+            time.sleep(0.05)
+    require(kernel_partition == number,
             f'Partition ID has wrong partition number: {partition}')
     return partition
 
