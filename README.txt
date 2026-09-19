@@ -147,6 +147,8 @@ e. command-line flags
 
 --stack
         backs up all intermediate snapshots from the source disk, rather than just the latest one
+        (An incremental backup always carries any snapshot created on the source after the base, such as one left
+        by clone, even without --stack, so a destination sharing that snapshot can be incrementally restored.)
 
 --unattended
         Forces non-interactive mode. If there is any ambiguity in the backup target, such as an unmounted disk that is not a previous backup target,
@@ -179,7 +181,8 @@ c. snapshot selection
 You will be presented with a list of snapshots for the given host. The most recent snapshot is selected by default.
 
 d. target disk selection.
-You will be presented with a list of unmounted drives eligible for restore.
+You will be presented with a list of unmounted drives eligible for restore. A drive that already holds a backup
+is labeled "Existing backup disk" so it is obvious that selecting it as the destination will destroy those backups.
 
 e. swap partition size selection
 If the snapshot contains a swap partition, this allows resizing it during a full restore. This can be useful if the OS was installed
@@ -187,7 +190,9 @@ with a swap partition smaller than the total RAM in the original host, which can
 26 with 24GB, when installing as ZFS root onto a 128GB SSD. The resulting swap partition was only 8GB.
 
 f. final confirmation
-You will be prompted to confirm the drive to overwrite during restore.
+You will be prompted to confirm the drive to overwrite during restore. On a normal disk you type DESTROY; on a disk
+that already holds backups you must instead type DESTROY BACKUPS, since selecting it as the destination erases those
+backups too.
 Ctrl-C requests cancellation and waits for cleanup. Further Ctrl-C signals are ignored during cleanup.
 An interrupted restore can leave the destination incomplete.
 
@@ -228,6 +233,11 @@ g. command-line flags
 
 --confirm
         Required with --unattended: authorizes full-target destruction or incremental replacement without a confirmation prompt.
+        Cannot be used without --unattended.
+
+--destroy_backup_disk
+        With --unattended, authorize a full restore onto a destination that is an existing backup disk (the unattended
+        equivalent of typing DESTROY BACKUPS). Without it, unattended restore onto a backup disk aborts and erases nothing.
         Cannot be used without --unattended.
 
 --discard <on|off>
@@ -296,6 +306,14 @@ This creates a clone of the current boot disk. The only required input is the ta
 your host, disconnect the existing boot disk, insert the clone, and boot from it. If you use hot swap, you can just
 keep this cloned disk handy for future disaster recovery, for example if your live boot disk hardware fails, becomes
 corrupt, has unwanted configuration or software regressions, or any other reason you might want to switch disk.
+
+Before writing, clone asks you to confirm the target by typing DESTROY; if the target is an existing backup disk, it
+instead requires DESTROY BACKUPS. In unattended mode (--unattended with --target and --confirm), pass
+--destroy_backup_disk to authorize erasing a target that already holds backups.
+
+By default, clone keeps the fresh source snapshot it takes (it no longer removes it afterward). Keeping it lets a later
+backup reuse the same snapshot (backup --snapshot_index 1), so an incremental restore of that backup can find a common
+snapshot on the clone. Pass --remove-snapshot to delete the snapshot after cloning, as earlier versions did.
 
 Concurrent operations
 ---------------------
