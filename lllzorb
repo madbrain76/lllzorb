@@ -634,6 +634,10 @@ def tree_nodes(nodes):
 DISK_IDS = Path('/dev/disk/by-id')
 HARDWARE_ID_PREFIXES = ('wwn-', 'nvme-eui.', 'nvme-uuid.', 'ata-', 'scsi-',
                         'nvme-', 'usb-', 'mmc-', 'ieee1394-', 'cciss-', 'pmem-', 'memstick-')
+# Bounded wait for the post-repartition kernel/udev rescan to finish before
+# erroring out. A freshly repartitioned disk lags before its partition device
+# nodes and by-id aliases reappear.
+PARTITION_RESYNC_TIMEOUT = 30.0
 
 
 def device_ids():
@@ -842,7 +846,17 @@ def partition_device(disk, number):
                 time.sleep(0.1)
     else:
         raise last_error
-    node = node_for(partition)
+    # The by-id alias can outpace the kernel rescan: the alias may resolve while
+    # the partition node is not yet visible to lsblk. Wait, bounded, for the node.
+    deadline=time.monotonic()+PARTITION_RESYNC_TIMEOUT
+    while True:
+        try:
+            node=node_for(partition)
+            break
+        except Error as exc:
+            if time.monotonic()>=deadline:
+                raise
+            time.sleep(0.05)
     require(node['type'] == 'part' and
             os.path.realpath(disk_for(partition)) == os.path.realpath(disk),
             f'Partition ID does not belong to selected disk: {partition}')
@@ -2288,6 +2302,32 @@ def print_existing_layout(device,node):
         print('  No partitions detected; whole-disk filesystem information is shown above.')
 
 
+def wait_partition_nodes(device, layout):
+    """Confirm the kernel and udev actually expose every partition we just wrote.
+
+    create_layout's partprobe rescan is asynchronous; a target that already had a
+    boot layout can lag before its partition device nodes and by-id aliases
+    reappear. Wait, bounded, until each expected node is visible rather than let a
+    later zpool receive race a not-yet-present device.
+    """
+    device=stable_device(device)
+    deadline=time.monotonic()+PARTITION_RESYNC_TIMEOUT
+    while True:
+        missing=[]
+        for p in layout:
+            path=f'{device}-part{p["number"]}'
+            try:
+                stable_device(path)
+                node_for(path)
+            except Error:
+                missing.append(p['number'])
+        if not missing or time.monotonic()>=deadline:
+            require(not missing, f'Partition(s) {missing} did not appear on {device} after layout; '
+                                 f'kernel/udev rescan did not complete within {PARTITION_RESYNC_TIMEOUT:.0f}s')
+            return
+        time.sleep(0.05)
+
+
 def create_layout(device, layout, count):
     device=stable_device(device)
     geometry=node_for(device)
@@ -2315,6 +2355,7 @@ def create_layout(device, layout, count):
                 expected=expected.lower();value=value.lower()
             require(value==expected,f'Written GPT p{p["number"]} {key} differs from plan')
     run('partprobe',device); run('udevadm','settle')
+    wait_partition_nodes(device,layout)
 
 
 @contextlib.contextmanager
@@ -2530,6 +2571,28 @@ def pack_esp(device,path):
             cr=compressor.wait(); tr=tar.wait()
             require(cr==0 and tr==0,'ESP archive failed')
             output.flush(); os.fsync(output.fileno())
+
+
+def capture_source_artifacts(m, base):
+    """Pack the boot artifacts a restore/clone target needs, read from the live source disk.
+
+    Writes into base/ (a scratch directory, not an imported pool): the GPT backup,
+    the first megabyte (MBR bootstrap), BIOS-boot images, and packed ESP archives.
+    Read-only with respect to the source disk.
+    """
+    base=Path(base)
+    (base/'disk').mkdir(parents=True, exist_ok=True)
+    (base/'efi').mkdir(parents=True, exist_ok=True)
+    run('sgdisk',f'--backup={base/"disk"/"gpt.bin"}',m['disk']['device'])
+    with open(m['disk']['device'],'rb') as disk:
+        (base/'disk'/'first-megabyte.bin').write_bytes(disk.read(MIB))
+    for p in m['disk']['partitions']:
+        if p['kind']=='bios_boot':
+            with open(p['source_device'],'rb') as src, open(base/p['image'],'xb') as dst:
+                shutil.copyfileobj(src,dst,4*MIB)
+            require((base/p['image']).stat().st_size==p['size_bytes'], 'Short BIOS metadata read')
+        elif p['kind']=='esp':
+            pack_esp(p['source_device'],base/p['archive'])
 
 
 def choose_unattended_backup_destination(source):
@@ -2797,16 +2860,7 @@ def backup(args):
                     (out/path).write_text(run(*argv),encoding='utf-8',errors='surrogateescape')
                 efi=run('efibootmgr','-v',check=False) if shutil.which('efibootmgr') else 'efibootmgr unavailable\n'
                 (out/'efi/efibootmgr.txt').write_text(efi,encoding='utf-8',errors='surrogateescape')
-                run('sgdisk',f'--backup={out/"disk/gpt.bin"}',m['disk']['device'])
-                with open(m['disk']['device'],'rb') as disk:
-                    (out/'disk/first-megabyte.bin').write_bytes(disk.read(MIB))
-                for p in m['disk']['partitions']:
-                    if p['kind']=='bios_boot':
-                        with open(p['source_device'],'rb') as src, open(out/p['image'],'xb') as dst:
-                            shutil.copyfileobj(src,dst,4*MIB)
-                        require((out/p['image']).stat().st_size==p['size_bytes'], 'Short BIOS metadata read')
-                    elif p['kind']=='esp':
-                        pack_esp(p['source_device'],out/p['archive'])
+                capture_source_artifacts(m,out)
                 if not previous:
                     ensure_native_parent(m['native_root'],**remote_kw)
                 storage_run('zfs','set','org.linux-os-backup:pending='+m['snapshot'],m['native_root'])
@@ -4062,6 +4116,133 @@ def restore_from_storage(args,base,remote=None):
         return clone_restore(base,m,device,plan,conflicts,stack=getattr(args,'stack',False),**remote_kw)
 
 
+def clone(args):
+    """Copy the running system's boot disk onto a spare disk as a directly-bootable image.
+
+    This is a same-host restore without the intermediate backup repository: a fresh
+    snapshot of the live source pools is streamed straight into freshly created pools
+    on the target. Because the source pools are the running OS, their GUIDs are always
+    in use, so the target gets new pool identities and its boot files are updated,
+    yielding a bootable drop-in replacement for the source disk.
+    """
+    commands('lsblk blkid findmnt zpool zfs zstream wipefs sgdisk partprobe udevadm tar zstd mkfs.fat mount umount')
+    unattended=getattr(args,'unattended',False)
+    dry_run=getattr(args,'dry_run',False)
+    if unattended:
+        require(getattr(args,'target',None) and getattr(args,'confirm',False),
+                '--unattended clone requires --target and --confirm')
+    # --- source: the running system's boot disk ---
+    m=discover()
+    m['hostname']=valid_hostname(getattr(args,'host',None) or socket.gethostname())
+    m['created_utc']=dt.datetime.now(dt.timezone.utc).isoformat()
+    m['boot']={'fstab':Path('/etc/fstab').read_text(), 'architecture':os.uname().machine,
+               'signed_efi':all(Path(p).is_file() for p in ('/usr/lib/shim/shimx64.efi.signed',
+                   '/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed'))}
+    m['boot']['manager']='proxmox-grub' if Path('/usr/sbin/proxmox-boot-tool').is_file() else 'ubuntu-grub'
+    if any(p['kind']=='bios_boot' for p in m['disk']['partitions']):
+        require(Path('/usr/lib/grub/i386-pc/modinfo.sh').is_file(), 'BIOS clone requires installed GRUB i386-pc modules')
+    validate_fstab(m['boot']['fstab'])
+    require(m['boot']['architecture']=='x86_64' and m['boot']['signed_efi'],
+            'Clone requires x86_64 with shim-signed and grub-efi-amd64-signed installed')
+    m['snapshot'],existing_snapshot=choose_source_snapshot(m['pools'],args)
+    for pool in m['pools']:
+        pool['estimated_send_bytes']=0; pool['stream_bytes']=1
+        pool['native_dataset']=pool['name']  # stream from the live pool, not a backup dataset
+    validate(m)
+    # --- target: an idle whole disk that is not the source disk ---
+    source_device=m['disk']['device']
+    protected={source_device}
+    device=stable_device(args.target or choose_destination('Clone target',[source_device]))
+    with restore_target_lock(device):
+        n=target_idle(device,protected)
+        conflicts=guid_conflicts(m)
+        if conflicts:
+            print(f'{diag_stamp()} Source pools are imported; the clone will use new pool identities and updated boot files.')
+        require(os.uname().machine=='x86_64','Only x86_64 EFI cloning is supported')
+        swap_sizes={}
+        if getattr(args,'swap',None) is not None:
+            swap_parts=[p for p in m['disk']['partitions'] if p['kind']=='swap']
+            require(len(swap_parts)==1,'--swap requires exactly one swap partition in the source')
+            require(args.swap>0,'--swap must be a positive MB value')
+            swap_sizes[swap_parts[0]['number']]=args.swap*MIB
+        elif not unattended:
+            swap_sizes=choose_restore_swap_sizes(m)
+        snap_created=[]
+        if not dry_run and not existing_snapshot:
+            snapshot_source_pools(m['pools'],m['snapshot'],completed=snap_created)
+        try:
+            if not dry_run:
+                for pool in m['pools']:
+                    pool['estimated_send_bytes']=estimate_native_send(pool,m['snapshot'],stack=False)
+                    pool['stream_bytes']=pool['estimated_send_bytes']
+            plan=solve(m,int(n['size']),int(n['log-sec']),swap_sizes=swap_sizes,allow_estimated_overflow=True)
+            for part in plan['partitions']:
+                if part['kind']=='bios_boot':
+                    original=next(p for p in m['disk']['partitions'] if p['number']==part['number'])
+                    start,end=original['start_lba'],original['end_lba']
+                    require(all(other is part or end<other['start_lba'] or start>other['start_lba'] for other in plan['partitions']),
+                            'BIOS boot area overlaps reconstructed partitions')
+                    part['start_lba']=start;part['end_lba']=end
+            for p in m['pools']:
+                require(2**p['ashift']>=int(n['phy-sec']),'Target physical sector size exceeds source ashift')
+            features=run('zpool','upgrade','-v')
+            for pool in m['pools']:
+                for key,item in pool['properties'].items():
+                    if key.startswith('feature@') and item['value'] in ('enabled','active'):
+                        require(key[8:] in features,f'Host OpenZFS lacks feature {key}')
+            print(f'Source: {source_device} ({m["disk"]["size_bytes"]/GIB:.2f} GiB, {len(m["disk"]["partitions"])} partitions)')
+            for pool in m['pools']:
+                print(f'  {pool["name"]}: '+dataset_size_text(saved_snapshot_sizes([pool],m['snapshot'])))
+            print(f'Target: {device}  {n.get("model") or ""}  {int(n["size"])/GIB:.2f} GiB')
+            print_existing_layout(device,n)
+            print('\nPROPOSED TARGET LAYOUT')
+            for p in plan['partitions']:
+                print(f'  p{p["number"]}: {p.get("pool",p["kind"])} {p["size_bytes"]/GIB:.3f} GiB, LBA {p["start_lba"]}–{p["end_lba"]}')
+            for name,estimate in plan['pools'].items():
+                size=sum(p['size_bytes'] for p in plan['partitions'] if p.get('pool')==name)
+                difference=size-estimate['allocation_bytes']
+                space=(f'free before pool overhead {difference/GIB:.2f} GiB' if difference>=0
+                       else f'estimated shortfall {-difference/GIB:.2f} GiB before pool overhead')
+                print(f'  {name}: estimated allocation {estimate["allocation_bytes"]/GIB:.2f} GiB; {space}')
+            print(f'Estimated minimum target: {plan["minimum_bytes"]/GIB:.2f} GiB')
+            confirm_restore_capacity(plan,args)
+            if dry_run:
+                print('Dry run complete. A real clone requires typing: DESTROY')
+                return
+            with tempfile.TemporaryDirectory(prefix='lllzorb-clone-src-') as tmp:
+                base=Path(tmp)
+                capture_source_artifacts(m,base)
+                discard=choose_restore_discard(args)
+                if not getattr(args,'confirm',False):
+                    confirm(device)
+                start_restore_timeline()
+                if getattr(args,'confirm',False):
+                    print(f'{diag_stamp()} Unattended mode: confirmed destruction of {destruction_target(device,n)}')
+                fresh=target_idle(device,protected)
+                require(all(fresh.get(k)==n.get(k) for k in ('size','log-sec','phy-sec','serial','wwn','maj:min')),
+                        'Target identity changed during confirmation')
+                conflicts=conflicts or guid_conflicts(m)
+                if discard:
+                    discard_restore_target(device)
+                else:
+                    print(f'{diag_stamp()} Discard target blocks: skipped',flush=True)
+                transferred=clone_restore(base,m,device,plan,conflicts,stack=False)
+        finally:
+            if snap_created:
+                if getattr(args,'keep_snapshot',False):
+                    print(f'{diag_stamp()} Kept source snapshot(s): {", ".join(snap_created)}')
+                else:
+                    try:
+                        remove_ephemeral_snapshots(snap_created)
+                        print(f'{diag_stamp()} Removed temporary source snapshot(s)')
+                    except Exception as exc:
+                        print(f'{diag_stamp()} Warning: could not remove temporary source snapshots: {exc}',file=sys.stderr)
+        print(f'{diag_stamp()} Clone complete: {device} is a bootable copy of {source_device}. Target pools exported.')
+        return transferred
+
+
+
+
 def snapshot_groups(namespace):
     if isinstance(namespace,(list,tuple)):
         merged={}
@@ -4578,6 +4759,7 @@ QUICK START
   ./lllzorb restore                 Select and restore a recovery point
   ./lllzorb verify                  Fully verify a recovery point
   ./lllzorb snapshots               Manage source or backup snapshots
+  ./lllzorb clone                     Copy the live boot disk to a spare disk
   ./lllzorb clone-backup            Copy a backup disk to another disk
   ./lllzorb --usage                 This page (no root privileges required)
   ./lllzorb COMMAND --help          Short option reference
@@ -4865,6 +5047,44 @@ CLONE A BACKUP DISK
     ./lllzorb clone-backup --source /dev/disk/by-id/wwn-BACKUP_DISK --target /dev/disk/by-id/wwn-CLONE_DISK --dry-run
     ./lllzorb clone-backup --source /dev/disk/by-id/wwn-BACKUP_DISK --target /dev/disk/by-id/wwn-CLONE_DISK
 
+CLONE A BOOT DISK
+  ./lllzorb clone [--target DEVICE] [--swap MB] [--dry-run]
+
+  Copy the running system's boot disk to a separately attached, idle disk and turn
+  that disk into a directly-bootable copy. No intermediate backup repository or
+  manifest is written. This is a same-host restore: because the source pools are the
+  running OS, the target is given new pool identities and its boot files are updated.
+
+  --target DEVICE
+      Whole destination disk (/dev/disk/by-id/...). The running source disk is never
+      eligible. Omit to select an idle disk interactively.
+  --swap MB
+      Set the clone's swap partition size in MB; omitted keeps the original size.
+  --discard on|off
+      Discard target blocks before cloning. Off by default (often unavailable through
+      USB bridges).
+  --allow-small-target
+      Accept an estimated capacity shortfall; the physical layout must still fit.
+  --snapshot_name NAME / --snapshot_index N
+      Clone an existing source snapshot instead of taking a fresh one; index 1 is the
+      most recent. Without either, a new snapshot is taken and removed afterward.
+  --keep-snapshot
+      Retain the temporary source snapshot after a successful clone instead of removing it.
+  --unattended / --confirm
+      Non-interactive clone. --confirm authorizes erasing the target without prompting.
+  --dry-run
+      Validate and display the proposed target layout without writing the target or
+      creating source snapshots.
+
+  Clone always writes a full image; use `restore --incremental` to update an existing
+  clone. Disconnect the completed disk until it replaces the source when booting.
+
+  Examples:
+    ./lllzorb clone --target /dev/disk/by-id/wwn-SPARE_DISK --dry-run
+    ./lllzorb clone --target /dev/disk/by-id/wwn-SPARE_DISK
+    ./lllzorb clone --target /dev/disk/by-id/wwn-SPARE_DISK --swap 32768
+
+
 REQUIREMENTS AND OPERATING NOTES
   * Ctrl-C during backup or restore requests cancellation and waits for cleanup.
     Further Ctrl-C signals are ignored. Pools stay imported if a transfer process
@@ -4957,12 +5177,26 @@ def main(argv=None,*,restore_isolated=False):
         print(f'\nlllzorb {VERSION}\n',flush=True)
     parser=argparse.ArgumentParser(description=__doc__,epilog='Run without arguments or with --usage for the full usage page.')
     parser.add_argument('--usage',action='store_true',help='Show the full usage page and examples')
-    sub=parser.add_subparsers(dest='command',metavar='{backup,restore,verify,snapshots,clone-backup,usage}')
+    sub=parser.add_subparsers(dest='command',metavar='{backup,clone,restore,verify,snapshots,clone-backup,usage}')
     sub.add_parser('usage',help='Show the full usage page and examples')
     cp=sub.add_parser('clone-backup',help='Copy an entire backup disk to another disk that can hold its contents')
     cp.add_argument('--source',help='Whole source backup disk by /dev/disk/by-id/; discovered interactively if omitted')
     cp.add_argument('--target',help='Whole destination disk by /dev/disk/by-id/ to erase; prompted if omitted')
     cp.add_argument('--dry-run',action='store_true',help='Inspect source and target without snapshotting or cloning')
+    cl=sub.add_parser('clone',help='Copy the live boot disk to a spare disk as a bootable image')
+    cl.add_argument('--target',dest='target',metavar='DEVICE',help='Whole destination disk by /dev/disk/by-id/; prompted if omitted')
+    cl.add_argument('--swap',type=int,metavar='MB',help='Set the clone swap partition size in MB; omitted keeps the original size')
+    cl.add_argument('--discard',choices=('on','off'),help='Discard target blocks before cloning; default off; errors abort clone')
+    cl.add_argument('--allow-small-target',action='store_true',help='Accept an estimated capacity shortfall; physical layout must still fit')
+    cl_snap=cl.add_mutually_exclusive_group()
+    cl_snap.add_argument('--snapshot_name',dest='snapshot_name',help='Clone an existing source snapshot instead of a fresh one')
+    cl_snap.add_argument('--snapshot_index',dest='snapshot_index',type=int,help='Existing source snapshot number, 1 being the most recent')
+    cl.add_argument('--keep-snapshot',action='store_true',help='Retain the temporary source snapshot instead of removing it after success')
+    cl.add_argument('--host',help='Hostname recorded in the image; defaults to the local hostname')
+    cl.add_argument('--unattended',action='store_true',help='Non-interactive clone; requires --target and --confirm')
+    cl.add_argument('--confirm',action='store_true',help='With --unattended, confirm target erasure without prompting')
+    cl.add_argument('--dry-run',action='store_true',help='Validate and display the target layout without writing the target or creating source snapshots')
+
     bp=sub.add_parser('backup',help='Back up the source disk to native ZFS storage')
     backup_mode=bp.add_mutually_exclusive_group()
     backup_mode.add_argument('--full',action='store_true',help='Start a new native full generation')
@@ -4993,7 +5227,7 @@ def main(argv=None,*,restore_isolated=False):
     rp.add_argument('--allow-small-target',action='store_true',help='Accept an estimated full-restore capacity shortfall; physical layout must still fit')
     rp.add_argument('--incremental',action='store_true',help='Reuse matching target partitions and pools; require a common snapshot, abort on mismatch')
     rp.add_argument('--dry-run',action='store_true',help='Validate and display the layout without destination writes')
-    for transfer_parser in (bp,rp):
+    for transfer_parser in (bp,rp,cl):
         transfer_parser.add_argument('--diagnostic',action='store_true',help='Log transfer stages, process waits, pool I/O and command timings to the terminal and a diagnostic file in the current directory')
     vp=sub.add_parser('verify',help='Read and verify a complete backup recovery point')
     vp.add_argument('--backup',metavar='DEVICE',help='Whole backup disk by /dev/disk/by-id/; discover disks if omitted')
@@ -5016,7 +5250,7 @@ def main(argv=None,*,restore_isolated=False):
     global DIAGNOSTIC
     DIAGNOSTIC=bool(getattr(args,'diagnostic',False))
     global DIAGNOSTIC_STARTED
-    DIAGNOSTIC_STARTED=None if args.command=='restore' else time.monotonic()
+    DIAGNOSTIC_STARTED=None if args.command in ('restore','clone') else time.monotonic()
     if args.usage or args.command in (None,'usage'):
         print(USAGE_PAGE);return 0
     try:
@@ -5027,7 +5261,7 @@ def main(argv=None,*,restore_isolated=False):
             require(not remote or not (getattr(args,'destination',None) or getattr(args,'backup',None)),
                     '--remote cannot be combined with a local backup disk')
         require(os.geteuid()==0,'Run as root')
-        if args.command=='restore' and not restore_isolated:
+        if args.command in ('restore','clone') and not restore_isolated:
             return isolated_restore(list(sys.argv[1:] if argv is None else argv))
         if args.command=='snapshots':
             return snapshots_main(args)
@@ -5038,7 +5272,7 @@ def main(argv=None,*,restore_isolated=False):
         with operation_interrupts(), diagnostic_session():
             transferred=None
             try:
-                transferred=(backup if args.command=='backup' else restore)(args)
+                transferred={'backup':backup,'restore':restore,'clone':clone}[args.command](args)
             finally:
                 if DIAGNOSTIC_STARTED is not None:
                     elapsed=time.monotonic()-DIAGNOSTIC_STARTED

@@ -1779,6 +1779,86 @@ class UnifiedCommandTests(unittest.TestCase):
             self.assertEqual([p.name for p in Path(tmp).iterdir()],['lllzorb'])
 
 
+class CloneCommandTests(unittest.TestCase):
+    """Tests for the `clone` command (live boot disk -> bootable spare disk).
+
+    Mirrors the CLONE_PLAN.md test plan. The same-host materialization and the
+    ephemeral-snapshot lifecycle are already exercised by CloneRestoreTests and
+    EphemeralBackupTests; here we cover the new command-specific behavior.
+    """
+
+    def test_clone_command_dispatch(self):
+        with patch.object(z.os,'geteuid',return_value=0),patch.object(z,'clone') as clone:
+            self.assertEqual(z.main(['clone','--target','/dev/test','--dry-run'],restore_isolated=True),0)
+            args=clone.call_args.args[0]
+            self.assertEqual(args.target,'/dev/test');self.assertTrue(args.dry_run)
+
+    def test_clone_flag_parsing(self):
+        with patch.object(z.os,'geteuid',return_value=0),patch.object(z,'clone') as clone:
+            self.assertEqual(z.main(['clone','--target','/dev/t','--swap','4096','--discard','on',
+                                     '--allow-small-target','--snapshot_name','snap1','--keep-snapshot',
+                                     '--host','host1','--unattended','--confirm','--dry-run'],
+                                    restore_isolated=True),0)
+            a=clone.call_args.args[0]
+            self.assertEqual(a.target,'/dev/t');self.assertEqual(a.swap,4096)
+            self.assertEqual(a.discard,'on');self.assertTrue(a.allow_small_target)
+            self.assertEqual(a.snapshot_name,'snap1');self.assertTrue(a.keep_snapshot)
+            self.assertEqual(a.host,'host1');self.assertTrue(a.unattended)
+            self.assertTrue(a.confirm);self.assertTrue(a.dry_run)
+
+    def test_clone_unattended_requires_target_and_confirm(self):
+        args=z.argparse.Namespace(unattended=True,confirm=False,dry_run=False,target=None)
+        with patch.object(z,'commands'),patch.object(z,'discover') as discover:
+            with self.assertRaisesRegex(z.Error,'requires --target and --confirm'):
+                z.clone(args)
+            discover.assert_not_called()
+
+    def test_native_dataset_streams_from_live_pool(self):
+        # The clone trick: point native_dataset at the live pool so the send is
+        # `zfs send -R -b <pool>@<snap>` straight from the running system.
+        m=native_fixture();pool=m['pools'][0]
+        pool['native_dataset']=pool['name']
+        pool.pop('datasets',None);pool.pop('stream',None);pool['encrypted']=False
+        snap=m['snapshot']
+        expected=['zfs','send','-R','-b',f"{pool['name']}@{snap}"]
+        self.assertEqual(z.native_send_argv(pool,snap),expected)
+        self.assertEqual(z.full_restore_streams(pool,snap,stack=True),[('',expected)])
+
+    def test_wait_partition_nodes_waits_for_lagging_kernel_node(self):
+        layout=[dict(number=1),dict(number=2)]
+        calls={'n':0}
+        def node_for(path,*a,**k):
+            if 'part1' in str(path):
+                calls['n']+=1
+                if calls['n']<3:
+                    raise z.Error('Block device not found: '+str(path))
+            return {'type':'part'}
+        with patch.object(z,'stable_device',side_effect=lambda p:p), patch.object(z,'node_for',side_effect=node_for), patch.object(z.time,'sleep'):
+            z.wait_partition_nodes('/dev/disk/by-id/wwn-D',layout)
+        self.assertGreaterEqual(calls['n'],3)
+
+    def test_wait_partition_nodes_errors_when_rescan_never_finishes(self):
+        layout=[dict(number=3)]
+        with patch.object(z,'stable_device',side_effect=lambda p:p), patch.object(z,'node_for',side_effect=z.Error('Block device not found: x')), patch.object(z.time,'sleep'), patch.object(z,'PARTITION_RESYNC_TIMEOUT',0):
+            with self.assertRaisesRegex(z.Error,'did not appear'):
+                z.wait_partition_nodes('/dev/disk/by-id/wwn-D',layout)
+
+    def test_source_disk_rejected_as_clone_target(self):
+        # The running source disk is passed as a protected disk to target_idle,
+        # which rejects it with a 'protected disk' error.
+        device='/dev/disk/by-id/wwn-SOURCE'
+        node={'type':'disk','path':device,'ro':False}
+        fake_stat=unittest.mock.MagicMock(st_mode=z.stat.S_IFBLK)
+        with patch.object(z,'node_for',return_value=node), \
+             patch.object(z,'stable_device',side_effect=lambda d,a=None:d), \
+             patch.object(z.os,'stat',return_value=fake_stat), \
+             patch.object(z.os.path,'realpath',side_effect=lambda p:p):
+            with self.assertRaisesRegex(z.Error,'protected disk'):
+                z.target_idle(device,forbidden={device})
+
+
+
+
 class BackupCloneTests(unittest.TestCase):
     def test_new_layout_uses_whole_target_for_data(self):
         for sector in (512,4096):
