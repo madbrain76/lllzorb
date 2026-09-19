@@ -1811,6 +1811,28 @@ def replication_flags(pool,m):
     return flags
 
 
+def snapshots_after_base(pool,name,base,tip=None):
+    """True when the live pool holds a snapshot of ``name`` newer than ``base``.
+
+    The incremental base is the newest stored recovery point, but other operations
+    (notably ``clone``) can leave newer snapshots on the source pool. A single-snapshot
+    incremental send skips them, so the backup store cannot match a destination that
+    carries one. Detecting them forces an intermediate-inclusive send. The ``tip`` being
+    backed up is never itself an intermediate and is ignored.
+    """
+    base_txg=val(pool['datasets'].get(name+'@'+base,{}),'createtxg')
+    if not base_txg.isdigit():
+        return False
+    for snapshot,properties in pool['datasets'].items():
+        if snapshot.startswith(name+'@'):
+            if tip is not None and snapshot==name+'@'+tip:
+                continue
+            txg=val(properties,'createtxg')
+            if txg.isdigit() and int(txg)>int(base_txg):
+                return True
+    return False
+
+
 def backup_streams(pool,m,previous=None):
     """Parent-first sends; --stack selects history for this operation only."""
     stacked=m.get('snapshot_history','history')=='history'
@@ -1831,7 +1853,11 @@ def backup_streams(pool,m,previous=None):
         entry=dict(source=name,destination=pool['native_dataset']+name[len(pool['name']):],
                    volume=val(properties,'type')=='volume',snapshot=m['snapshot'])
         if incremental:
-            flags+=['-I' if stacked else '-i',name+'@'+m['base_snapshot']]
+            # Include intermediate snapshots so the store mirrors every source snapshot
+            # created after the base (for example, a snapshot retained by `clone`); a
+            # bare -i would skip them and leave a destination holding one unmatched.
+            flags+=['-I' if stacked or snapshots_after_base(pool,name,m['base_snapshot'],m['snapshot']) else '-i',
+                    name+'@'+m['base_snapshot']]
         elif stacked:
             # Newly added datasets have no backup base. Seed their oldest snapshot
             # then send the remaining history, without depending on clone origins.
@@ -2235,16 +2261,17 @@ def choose_destination(prompt, forbidden=(), allow_path=False, unattended=False)
                 break
             print('Press Enter to refresh, or type q to quit.')
     candidates.sort(key=lambda pair:(pair[0],pair[1]['path']))
-    backups=[n for _,n in candidates if any(x.get('fstype')=='zfs_member' and
-             (x.get('label') or '').startswith(('linux_os_backup_','baremetal_store_'))
-             for x in tree_nodes([n]))] if allow_path else []
+    backup_disks=[n for _,n in candidates if node_is_backup_disk(n)]
+    backups=backup_disks if allow_path else []
     default=backups[0]['path'] if len(backups)==1 else (candidates[0][1]['path'] if candidates and not candidates[0][0] else None)
     print('\nAvailable backup targets:' if allow_path else '\nAvailable restore destinations:')
     choices=[]
     for nonempty,n in candidates:
         status='contains data' if nonempty else 'empty'
-        if allow_path:
-            status='Existing backup disk' if n in backups else 'Other disk; '+status
+        if n in backup_disks:
+            status='Existing backup disk'
+        elif allow_path:
+            status='Other disk; '+status
         if any(x.get('device_id_error') for x in tree_nodes([n])):
             status+='; persistent ID unavailable (cannot use)'
         if n['path']==default:
@@ -2272,19 +2299,45 @@ def choose_destination(prompt, forbidden=(), allow_path=False, unattended=False)
     return answer
 
 
+BACKUP_POOL_PREFIXES = ('linux_os_backup_', 'baremetal_store_')
+
+
+def node_is_backup_disk(node):
+    return any(x.get('fstype') == 'zfs_member' and
+               (x.get('label') or '').startswith(BACKUP_POOL_PREFIXES)
+               for x in tree_nodes([node]))
+
+
+def is_backup_disk(device, node=None):
+    return node_is_backup_disk(node if node is not None else node_for(device))
+
+
 def destruction_target(device,node=None):
     node=node if node is not None else node_for(device)
     model=' '.join(str(node.get('model') or '').split()) or 'unavailable'
     return f'{device} (model: {model})'
 
 
-def confirm(device,skip=False):
-    phrase='DESTROY'
-    target=destruction_target(device)
+def destruction_phrase(device,node=None):
+    return 'DESTROY BACKUPS' if is_backup_disk(device,node) else 'DESTROY'
+
+
+def confirm(device,skip=False,allow_backup=False,node=None):
+    node=node if node is not None else node_for(device)
+    backup=node_is_backup_disk(node)
+    phrase='DESTROY BACKUPS' if backup else 'DESTROY'
+    target=destruction_target(device,node)
     if skip:
+        require(not backup or allow_backup,
+                f'{target} is an existing backup disk; re-run with --destroy_backup_disk to authorize destroying its backups')
         print(f'{diag_stamp()} Unattended mode: confirmed destruction of {target}')
         return
-    require(input(f'All data on {target} will be destroyed.\nType {phrase} to confirm: ').strip()==phrase,
+    if backup:
+        prompt=(f'All data on {target} is an existing backup disk: backups and all other data will be destroyed.\n'
+                f'Type {phrase} to confirm: ')
+    else:
+        prompt=f'All data on {target} will be destroyed.\nType {phrase} to confirm: '
+    require(input(prompt).strip()==phrase,
             'Confirmation did not match; aborted')
 
 
@@ -3924,7 +3977,7 @@ def incremental_restore_from_storage(args,base,manifest,remote=None):
             for name in plan['remove_snapshots']:print('    Remove target snapshot: '+pool['name']+name)
             for name in plan['remove_datasets']:print('    Remove target dataset tree: '+pool['name']+name)
         with incremental_boot_files(base,device,layout) as staged:
-            phrase=f'INCREMENTAL RESTORE {device}'
+            phrase='RESTORE'
             if args.dry_run:
                 print(f'Dry run complete. A real incremental restore requires typing: {phrase}')
                 return
@@ -3933,7 +3986,7 @@ def incremental_restore_from_storage(args,base,manifest,remote=None):
                         'Confirmation did not match; aborted')
             start_restore_timeline()
             if getattr(args,'unattended',False):
-                print(f'{diag_stamp()} Unattended mode: '+phrase)
+                print(f'{diag_stamp()} Unattended mode: confirmed incremental restore of {device}')
             fresh=target_idle(device,protected)
             require(all(fresh.get(k)==node.get(k) for k in ('size','log-sec','phy-sec','serial','wwn','maj:min')),
                     'Incremental target identity changed during confirmation')
@@ -4115,13 +4168,19 @@ def restore_from_storage(args,base,remote=None):
                 require(p['start_lba']==original['start_lba'],'Unchanged BIOS boot metadata requires its original partition position')
         confirm_restore_capacity(plan,args)
         if args.dry_run:
-            print(f'Dry run complete. A real restore requires typing: DESTROY')
+            print(f'Dry run complete. A real restore requires typing: {destruction_phrase(device,n)}')
             return
         discard=choose_restore_discard(args)
+        allow_backup=getattr(args,'destroy_backup_disk',False)
         if not getattr(args,'confirm',False):
-            confirm(device)
+            if node_is_backup_disk(n):
+                confirm(device,node=n)
+            else:
+                confirm(device)
         start_restore_timeline()
         if getattr(args,'confirm',False):
+            require(not node_is_backup_disk(n) or allow_backup,
+                    f'{destruction_target(device,n)} is an existing backup disk; re-run with --destroy_backup_disk to authorize destroying its backups')
             print(f'{diag_stamp()} Unattended mode: confirmed destruction of {destruction_target(device,n)}')
         fresh=target_idle(device,protected)
         require(all(fresh.get(k)==n.get(k) for k in ('size','log-sec','phy-sec','serial','wwn','maj:min')),
@@ -4225,16 +4284,22 @@ def clone(args):
             print(f'Estimated minimum target: {plan["minimum_bytes"]/GIB:.2f} GiB')
             confirm_restore_capacity(plan,args)
             if dry_run:
-                print('Dry run complete. A real clone requires typing: DESTROY')
+                print(f'Dry run complete. A real clone requires typing: {destruction_phrase(device,n)}')
                 return
             with tempfile.TemporaryDirectory(prefix='lllzorb-clone-src-') as tmp:
                 base=Path(tmp)
                 capture_source_artifacts(m,base)
                 discard=choose_restore_discard(args)
+                allow_backup=getattr(args,'destroy_backup_disk',False)
                 if not getattr(args,'confirm',False):
-                    confirm(device)
+                    if node_is_backup_disk(n):
+                        confirm(device,node=n)
+                    else:
+                        confirm(device)
                 start_restore_timeline()
                 if getattr(args,'confirm',False):
+                    require(not node_is_backup_disk(n) or allow_backup,
+                            f'{destruction_target(device,n)} is an existing backup disk; re-run with --destroy_backup_disk to authorize destroying its backups')
                     print(f'{diag_stamp()} Unattended mode: confirmed destruction of {destruction_target(device,n)}')
                 fresh=target_idle(device,protected)
                 require(all(fresh.get(k)==n.get(k) for k in ('size','log-sec','phy-sec','serial','wwn','maj:min')),
@@ -4247,14 +4312,15 @@ def clone(args):
                 transferred=clone_restore(base,m,device,plan,conflicts,stack=False)
         finally:
             if snap_created:
-                if getattr(args,'keep_snapshot',False):
-                    print(f'{diag_stamp()} Kept source snapshot(s): {", ".join(snap_created)}')
-                else:
+                if getattr(args,'remove_snapshot',False):
                     try:
                         remove_ephemeral_snapshots(snap_created)
                         print(f'{diag_stamp()} Removed temporary source snapshot(s)')
                     except Exception as exc:
                         print(f'{diag_stamp()} Warning: could not remove temporary source snapshots: {exc}',file=sys.stderr)
+                else:
+                    print(f'{diag_stamp()} Kept source snapshot(s): {", ".join(snap_created)} '
+                          '(reuse with: backup --snapshot_index 1)')
         print(f'{diag_stamp()} Clone complete: {device} is a bootable copy of {source_device}. Target pools exported.')
         return transferred
 
@@ -4879,6 +4945,9 @@ BACKUP
       snapshots since the selected base; new datasets include their older history.
       Without --stack, both full and incremental backups send only the new snapshot
       of each dataset, even when an existing generation previously included history.
+      A single incremental still carries any snapshot created on the source after the
+      base (for example one kept by clone), so a destination holding it can restore
+      incrementally; --stack is not required to keep that shared snapshot restorable.
       Already stored snapshots are retained. Source snapshots remain untouched.
       You may toggle --stack between backups without starting a new generation.
       New ordinary clones sent individually become independent copies. A new
@@ -4949,6 +5018,10 @@ RESTORE
   --confirm
       With --unattended, confirm both full-target destruction and incremental
       target replacement without an interactive confirmation prompt.
+  --destroy_backup_disk
+      With --unattended, authorize a full restore whose destination is an existing
+      backup disk. Interactive full restore requires typing DESTROY BACKUPS on such
+      a disk; without this flag unattended restore aborts and erases nothing.
   --dry-run
       Check backup metadata, snapshot identities, ESP archives, and target layout.
       Stop before destination writes. Use verify to fully read native backup data.
@@ -4973,7 +5046,7 @@ RESTORE
       Match snapshot GUIDs in every pool and its existing datasets. Missing bases
       or layout mismatches abort; never fall back to erasing the target.
       Show the chosen bases, stream estimates, and exact target snapshot/dataset
-      removals before requiring INCREMENTAL RESTORE <disk-id>. Unsnapshotted target
+      removals before requiring typing RESTORE. Unsnapshotted target
       changes are discarded. Recheck after confirmation. --dry-run uses read-only
       target imports and performs no target writes or confirmation prompt.
       Target must be idle, with its actual pool GUIDs unimported elsewhere. Targets
@@ -5085,11 +5158,19 @@ CLONE A BOOT DISK
       Accept an estimated capacity shortfall; the physical layout must still fit.
   --snapshot_name NAME / --snapshot_index N
       Clone an existing source snapshot instead of taking a fresh one; index 1 is the
-      most recent. Without either, a new snapshot is taken and removed afterward.
+      most recent. Without either, a new snapshot of the current state is taken and
+      retained afterward so a later backup can chain off it (backup --snapshot_index 1).
   --keep-snapshot
-      Retain the temporary source snapshot after a successful clone instead of removing it.
+      Retain the fresh source snapshot after a successful clone. This is now the default;
+      the flag is accepted for compatibility.
+  --remove-snapshot
+      Remove the fresh source snapshot after a successful clone, restoring the previous
+      ephemeral behavior. Mutually exclusive with --keep-snapshot.
   --unattended / --confirm
       Non-interactive clone. --confirm authorizes erasing the target without prompting.
+  --destroy_backup_disk
+      With --unattended, authorize erasing a target that is an existing backup disk
+      (interactive clone requires typing DESTROY BACKUPS on such a target).
   --dry-run
       Validate and display the proposed target layout without writing the target or
       creating source snapshots.
@@ -5209,10 +5290,13 @@ def main(argv=None,*,restore_isolated=False):
     cl_snap=cl.add_mutually_exclusive_group()
     cl_snap.add_argument('--snapshot_name',dest='snapshot_name',help='Clone an existing source snapshot instead of a fresh one')
     cl_snap.add_argument('--snapshot_index',dest='snapshot_index',type=int,help='Existing source snapshot number, 1 being the most recent')
-    cl.add_argument('--keep-snapshot',action='store_true',help='Retain the temporary source snapshot instead of removing it after success')
+    cl_snap_action=cl.add_mutually_exclusive_group()
+    cl_snap_action.add_argument('--keep-snapshot',action='store_true',help='Retain the fresh source snapshot after cloning (default)')
+    cl_snap_action.add_argument('--remove-snapshot',action='store_true',help='Remove the fresh source snapshot after cloning instead of retaining it')
     cl.add_argument('--host',help='Hostname recorded in the image; defaults to the local hostname')
     cl.add_argument('--unattended',action='store_true',help='Non-interactive clone; requires --target and --confirm')
     cl.add_argument('--confirm',action='store_true',help='With --unattended, confirm target erasure without prompting')
+    cl.add_argument('--destroy_backup_disk',action='store_true',help='With --unattended, authorize erasing a target that is an existing backup disk')
     cl.add_argument('--dry-run',action='store_true',help='Validate and display the target layout without writing the target or creating source snapshots')
 
     bp=sub.add_parser('backup',help='Back up the source disk to native ZFS storage')
@@ -5241,6 +5325,7 @@ def main(argv=None,*,restore_isolated=False):
     rp.add_argument('--swap',type=int,metavar='MB',help='Set the full-restore swap partition size in MB')
     rp.add_argument('--unattended',action='store_true',help='Non-interactive restore; requires --source, --destination, and --confirm')
     rp.add_argument('--confirm',action='store_true',help='With --unattended, confirm destructive full or incremental restore without prompting')
+    rp.add_argument('--destroy_backup_disk',action='store_true',help='With --unattended, authorize erasing a restore destination that is an existing backup disk')
     rp.add_argument('--discard',choices=('on','off'),help='Discard before full restore; default off; errors abort restore')
     rp.add_argument('--allow-small-target',action='store_true',help='Accept an estimated full-restore capacity shortfall; physical layout must still fit')
     rp.add_argument('--incremental',action='store_true',help='Reuse matching target partitions and pools; require a common snapshot, abort on mismatch')
